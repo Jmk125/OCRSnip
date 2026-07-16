@@ -351,7 +351,22 @@ class SnipOverlay:
             return
         if sys.platform == "win32":
             user32 = ctypes.windll.user32
-            hwnd_topmost = ctypes.c_void_p(-1)
+            wintypes = ctypes.wintypes
+
+            # Declare handle/argument types so the 64-bit HWNDs are passed
+            # whole. Without this, ctypes marshals handles as 32-bit ints and
+            # truncates them, so SetWindowPos targets a bogus window and the
+            # overlay never leaves its default (0,0) position.
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+
+            hwnd_topmost = wintypes.HWND(-1)
             swp_noactivate_show = 0x0010 | 0x0040
             ga_root = 2  # GetAncestor(GA_ROOT): the real top-level frame HWND
             self.window.update_idletasks()
@@ -361,15 +376,18 @@ class SnipOverlay:
             # takes raw signed coordinates, so negative origins (monitors above
             # or left of primary) are placed correctly.
             hwnd = user32.GetAncestor(self.window.winfo_id(), ga_root) or self.window.winfo_id()
-            user32.SetWindowPos(hwnd, hwnd_topmost,
-                                self.origin_x, self.origin_y,
-                                self.width, self.height, swp_noactivate_show)
+            ok = user32.SetWindowPos(hwnd, hwnd_topmost,
+                                     self.origin_x, self.origin_y,
+                                     self.width, self.height, swp_noactivate_show)
             self.canvas.configure(width=self.width, height=self.height)
             self.window.update_idletasks()
 
             if DEBUG_OVERLAY:
+                placed = wintypes.RECT()
+                user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(placed))
                 log(f"[overlay] target={self.width}x{self.height}"
-                    f"@({self.origin_x},{self.origin_y}) "
+                    f"@({self.origin_x},{self.origin_y}) SetWindowPos_ok={bool(ok)} "
+                    f"actual=({placed.left},{placed.top})-({placed.right},{placed.bottom}) "
                     f"canvas={self.canvas.winfo_width()}x{self.canvas.winfo_height()}")
         self.focus()
 
