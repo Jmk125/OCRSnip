@@ -72,6 +72,11 @@ TITLE_CASE_KEEP_SHORT_UPPER = 2
 POPUP_DURATION_MS = 4000       # how long the popup stays up (click to dismiss early)
 POPUP_MAX_CHARS = 400          # truncate very long captures in the popup
 POPUP_WIDTH = 360              # popup width in pixels
+
+# ---- DEBUGGING ----------------------------------------------------------
+# Set True to print each monitor's rectangle and the resulting overlay /
+# canvas size. Useful for diagnosing multi-monitor / mixed-DPI coverage.
+DEBUG_OVERLAY = False
 # -------------------------------------------------------------------------
 
 # --- Resolve tesseract relative to this script / exe ---------------------
@@ -210,6 +215,18 @@ def monitor_rectangles(root):
 
     monitors = []
     user32 = ctypes.windll.user32
+
+    # Make sure this thread is per-monitor-v2 aware *before* enumerating, so
+    # the RECTs come back in physical pixels rather than in the primary
+    # monitor's virtualized (scaled) coordinate space. If awareness is wrong
+    # here, external monitors with a different scale factor report a rectangle
+    # that does not match their real pixels - which is exactly what leaves the
+    # overlay short or shifted on those screens.
+    try:
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+
     callback_type = ctypes.WINFUNCTYPE(
         ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.POINTER(ctypes.wintypes.RECT), ctypes.wintypes.LPARAM,
@@ -224,6 +241,11 @@ def monitor_rectangles(root):
         user32.EnumDisplayMonitors(0, 0, callback_type(add_monitor), 0)
     except Exception as exc:
         log(f"Could not enumerate monitors: {exc}")
+
+    if DEBUG_OVERLAY:
+        for left, top, right, bottom in monitors:
+            log(f"[monitor] left={left} top={top} right={right} bottom={bottom} "
+                f"-> {right - left}x{bottom - top}")
 
     return monitors or [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
 
@@ -255,7 +277,7 @@ class SnipOverlay:
             canvas.bind("<ButtonRelease-1>", lambda event, c=canvas, w=window: self.on_release(event, c, w))
             window.bind("<Escape>", lambda _event: self.cancel())
             self.tops.append(window)
-            self.rectangles.append((window, left, top, right, bottom))
+            self.rectangles.append((window, canvas, left, top, right, bottom))
 
         # Let the window manager finish mapping the windows before requesting
         # focus, otherwise the hotkey can occasionally leave an inert overlay.
@@ -274,11 +296,30 @@ class SnipOverlay:
             user32 = ctypes.windll.user32
             hwnd_topmost = ctypes.c_void_p(-1)
             swp_noactivate_show = 0x0010 | 0x0040
-            for window, left, top, right, bottom in self.rectangles:
+            ga_root = 2  # GetAncestor(GA_ROOT): the real top-level frame HWND
+            for window, canvas, left, top, right, bottom in self.rectangles:
+                width, height = right - left, bottom - top
                 window.update_idletasks()
-                user32.SetWindowPos(window.winfo_id(), hwnd_topmost, left, top,
-                                    right - left, bottom - top,
-                                    swp_noactivate_show)
+
+                # winfo_id() can return an inner child HWND for a Tk toplevel;
+                # SetWindowPos must move the actual top-level frame or the
+                # window (and the canvas that fills it) can end up short or
+                # offset on a monitor whose scale factor differs from primary.
+                hwnd = user32.GetAncestor(window.winfo_id(), ga_root) or window.winfo_id()
+                user32.SetWindowPos(hwnd, hwnd_topmost, left, top,
+                                    width, height, swp_noactivate_show)
+
+                # Don't trust pack()/DPI-scaling to have sized the canvas to
+                # the physical monitor. Pin it explicitly to the real pixel
+                # dimensions so the whole screen is snippable, not just a strip.
+                canvas.configure(width=width, height=height)
+                window.geometry(f"{width}x{height}{left:+d}{top:+d}")
+                window.update_idletasks()
+
+                if DEBUG_OVERLAY:
+                    log(f"[overlay] target={width}x{height}@({left},{top}) "
+                        f"window={window.winfo_width()}x{window.winfo_height()} "
+                        f"canvas={canvas.winfo_width()}x{canvas.winfo_height()}")
         self.focus()
 
     def focus(self):
@@ -490,6 +531,19 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
+
+    if sys.platform == "win32":
+        # Tk 8.6 is not per-monitor-DPI aware: it picks one scale factor at
+        # startup (the primary monitor's) and applies it everywhere. Force the
+        # scaling back to 1.0 so overlay geometry and canvas/mouse coordinates
+        # are raw physical pixels, matching the monitor rectangles and
+        # ImageGrab. Without this, external monitors on a different scale get a
+        # short/offset grab area.
+        try:
+            root.tk.call("tk", "scaling", 1.0)
+        except Exception:
+            pass
+
     root.snip_controller = SnipController(root)
 
     if sys.platform == "win32":
