@@ -91,19 +91,55 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 # -------------------------------------------------------------------------
 
 # --- Make the process DPI-aware (fixes offset captures on scaled displays)
+# NOTE: If a manifest (e.g. the one PyInstaller bakes into the .exe) already
+# declared a DPI-awareness level, that level is LOCKED for the life of the
+# process and every call below fails silently. That is why a scaled external
+# monitor can still get a short/offset overlay in the built exe even though
+# this code asks for per-monitor-v2. See OCRSnip.manifest / build-ocrsnip.bat.
+_DPI_AWARENESS_SET = False
 if sys.platform == "win32":
     try:
         # Per-monitor v2 also keeps Tk's coordinates aligned with monitors that
         # use different display scaling values.
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            _DPI_AWARENESS_SET = True
     except Exception:
+        pass
+    if not _DPI_AWARENESS_SET:
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            # S_OK == 0. Non-zero (e.g. E_ACCESSDENIED) means it was already set.
+            if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+                _DPI_AWARENESS_SET = True
         except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
+            pass
+    if not _DPI_AWARENESS_SET:
+        try:
+            if ctypes.windll.user32.SetProcessDPIAware():
+                _DPI_AWARENESS_SET = True
+        except Exception:
+            pass
+
+
+def describe_dpi_awareness():
+    """Return the process's *effective* DPI-awareness for diagnostics."""
+    if sys.platform != "win32":
+        return "n/a"
+    names = {
+        ctypes.c_void_p(-1).value: "UNAWARE",
+        ctypes.c_void_p(-2).value: "SYSTEM_AWARE",
+        ctypes.c_void_p(-3).value: "PER_MONITOR_AWARE",
+        ctypes.c_void_p(-4).value: "PER_MONITOR_AWARE_V2",
+        ctypes.c_void_p(-5).value: "UNAWARE_GDISCALED",
+    }
+    try:
+        ctx = ctypes.windll.user32.GetThreadDpiAwarenessContext()
+        for value, name in names.items():
+            if ctypes.windll.user32.AreDpiAwarenessContextsEqual(
+                    ctypes.c_void_p(ctx), ctypes.c_void_p(value)):
+                return name
+        return f"unknown({ctx})"
+    except Exception as exc:
+        return f"query-failed({exc})"
 # -------------------------------------------------------------------------
 
 events = queue.Queue()
@@ -553,6 +589,10 @@ def main():
         keyboard.add_hotkey(HOTKEY_QUIT, lambda: events.put("quit"))
 
     log(f"OCR Snip running.  {HOTKEY_SNIP.upper()} = snip,  {HOTKEY_QUIT.upper()} = quit")
+    if sys.platform == "win32":
+        log(f"DPI awareness: {describe_dpi_awareness()} "
+            f"(runtime set: {_DPI_AWARENESS_SET})  "
+            "-- must be PER_MONITOR_AWARE_V2 for correct multi-monitor overlays")
     log(f"Tesseract path: {TESSERACT_PATH}")
     log(f"Formatting: JOIN_LINES={JOIN_LINES}, CASE_MODE='{CASE_MODE}'")
 

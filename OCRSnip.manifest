@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="OCRSnip" version="1.0.0.0" processorArchitecture="*"/>
+  <!--
+    Force PER-MONITOR-V2 DPI awareness for the built .exe.
+
+    PyInstaller otherwise embeds a manifest that marks the exe as merely
+    "system DPI aware" (dpiAware=true). That level is locked at process
+    startup, so the SetProcessDpiAwarenessContext call in ocr_snip.py cannot
+    upgrade it, Windows virtualizes any monitor whose scale differs from the
+    primary, and the snip overlay ends up short/offset on those screens.
+
+    dpiAware   -> honored by Windows 7+ (true/pm = per-monitor v1)
+    dpiAwareness -> honored by Windows 10 1607+ (PerMonitorV2 preferred,
+                    falling back to PerMonitor, then System).
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor, System</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

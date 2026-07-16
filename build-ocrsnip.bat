@@ -23,7 +23,15 @@ if exist "app.ico" (
     echo [warn] app.ico not found - building without an icon
 )
 
-python -m PyInstaller --onefile --noconsole --name OCRSnip %ICON_ARGS% ocr_snip.py
+set MANIFEST_ARGS=
+if exist "OCRSnip.manifest" (
+    set MANIFEST_ARGS=--manifest "OCRSnip.manifest"
+) else (
+    echo [warn] OCRSnip.manifest not found - exe will be system-DPI-aware and
+    echo        the snip overlay may be short/offset on scaled external monitors
+)
+
+python -m PyInstaller --onefile --noconsole --name OCRSnip %ICON_ARGS% %MANIFEST_ARGS% ocr_snip.py
 
 echo.
 echo Build complete: dist\OCRSnip.exe
