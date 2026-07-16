@@ -42,9 +42,11 @@ import os
 import queue
 import re
 import sys
+import threading
 import tkinter as tk
 
-import keyboard
+if sys.platform != "win32":
+    import keyboard
 import pyperclip
 import pytesseract
 from PIL import Image, ImageGrab, ImageOps
@@ -108,6 +110,43 @@ def log(msg):
         print(msg)
     except Exception:
         pass
+
+
+class WindowsHotkeyListener(threading.Thread):
+    """Reliable native global-hotkey message loop for the Windows build."""
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    WM_HOTKEY = 0x0312
+    SNIP_ID = 1
+    QUIT_ID = 2
+
+    def __init__(self):
+        super().__init__(name="OCRSnipHotkeys", daemon=True)
+
+    def run(self):
+        user32 = ctypes.windll.user32
+        modifiers = self.MOD_ALT | self.MOD_CONTROL
+        registered_snip = user32.RegisterHotKey(None, self.SNIP_ID, modifiers, ord("S"))
+        registered_quit = user32.RegisterHotKey(None, self.QUIT_ID, modifiers, ord("Q"))
+        if not registered_snip:
+            events.put(("hotkey_error", "Ctrl+Alt+S is unavailable; another app may be using it."))
+        if not registered_quit:
+            events.put(("hotkey_error", "Ctrl+Alt+Q is unavailable; another app may be using it."))
+
+        message = ctypes.wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                if message.message != self.WM_HOTKEY:
+                    continue
+                if message.wParam == self.SNIP_ID:
+                    events.put("snip")
+                elif message.wParam == self.QUIT_ID:
+                    events.put("quit")
+        finally:
+            if registered_snip:
+                user32.UnregisterHotKey(None, self.SNIP_ID)
+            if registered_quit:
+                user32.UnregisterHotKey(None, self.QUIT_ID)
 
 
 # ======================= TEXT FORMATTING ==================================
@@ -198,6 +237,7 @@ class SnipOverlay:
         self.start = None
         self.rect = None
         self.tops = []
+        self.rectangles = []
         self.closed = False
 
         for left, top, right, bottom in monitor_rectangles(root):
@@ -215,10 +255,31 @@ class SnipOverlay:
             canvas.bind("<ButtonRelease-1>", lambda event, c=canvas, w=window: self.on_release(event, c, w))
             window.bind("<Escape>", lambda _event: self.cancel())
             self.tops.append(window)
+            self.rectangles.append((window, left, top, right, bottom))
 
         # Let the window manager finish mapping the windows before requesting
         # focus, otherwise the hotkey can occasionally leave an inert overlay.
-        self.root.after_idle(self.focus)
+        self.root.after_idle(self.place_and_focus)
+
+    def place_and_focus(self):
+        """Use physical pixels for the final window placement on Windows.
+
+        Tk's geometry manager can apply its own DPI scaling to a Toplevel.  A
+        native SetWindowPos after Tk maps the window prevents a scaled external
+        monitor from having an uncovered strip along its edge.
+        """
+        if self.closed:
+            return
+        if sys.platform == "win32":
+            user32 = ctypes.windll.user32
+            hwnd_topmost = ctypes.c_void_p(-1)
+            swp_noactivate_show = 0x0010 | 0x0040
+            for window, left, top, right, bottom in self.rectangles:
+                window.update_idletasks()
+                user32.SetWindowPos(window.winfo_id(), hwnd_topmost, left, top,
+                                    right - left, bottom - top,
+                                    swp_noactivate_show)
+        self.focus()
 
     def focus(self):
         if not self.closed and self.tops:
@@ -404,6 +465,9 @@ def poll(root):
             elif evt == "quit":
                 root.destroy()
                 return
+            elif isinstance(evt, tuple) and evt[0] == "hotkey_error":
+                log(f"[hotkey error] {evt[1]}")
+                notify(root, "Shortcut unavailable", evt[1], error=True)
     except queue.Empty:
         pass
     except Exception as exc:
@@ -415,12 +479,24 @@ def poll(root):
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            # A PyInstaller manifest or another library may have already set
+            # process DPI awareness. Set the UI thread explicitly before Tk
+            # creates any windows so monitor geometry stays in physical pixels.
+            ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            pass
+
     root = tk.Tk()
     root.withdraw()
     root.snip_controller = SnipController(root)
 
-    keyboard.add_hotkey(HOTKEY_SNIP, lambda: events.put("snip"))
-    keyboard.add_hotkey(HOTKEY_QUIT, lambda: events.put("quit"))
+    if sys.platform == "win32":
+        WindowsHotkeyListener().start()
+    else:
+        keyboard.add_hotkey(HOTKEY_SNIP, lambda: events.put("snip"))
+        keyboard.add_hotkey(HOTKEY_QUIT, lambda: events.put("quit"))
 
     log(f"OCR Snip running.  {HOTKEY_SNIP.upper()} = snip,  {HOTKEY_QUIT.upper()} = quit")
     log(f"Tesseract path: {TESSERACT_PATH}")
