@@ -37,6 +37,7 @@ Exit:
 """
 
 import ctypes
+import ctypes.wintypes
 import os
 import queue
 import re
@@ -85,12 +86,17 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 # --- Make the process DPI-aware (fixes offset captures on scaled displays)
 if sys.platform == "win32":
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        # Per-monitor v2 also keeps Tk's coordinates aligned with monitors that
+        # use different display scaling values.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
-            pass
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 # -------------------------------------------------------------------------
 
 events = queue.Queue()
@@ -158,42 +164,95 @@ def to_sentence_case(text):
 
 # ======================= SNIP OVERLAY =====================================
 
+def monitor_rectangles(root):
+    """Return physical monitor rectangles, including monitors left of primary."""
+    if sys.platform != "win32":
+        return [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
+
+    monitors = []
+    user32 = ctypes.windll.user32
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.wintypes.RECT), ctypes.wintypes.LPARAM,
+    )
+
+    def add_monitor(_handle, _hdc, rect, _data):
+        monitors.append((rect.contents.left, rect.contents.top,
+                         rect.contents.right, rect.contents.bottom))
+        return 1
+
+    try:
+        user32.EnumDisplayMonitors(0, 0, callback_type(add_monitor), 0)
+    except Exception as exc:
+        log(f"Could not enumerate monitors: {exc}")
+
+    return monitors or [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
+
+
 class SnipOverlay:
-    def __init__(self, root):
+    """One selection session represented by a dimmed window on every monitor."""
+    def __init__(self, root, on_cancel, on_selection):
         self.root = root
+        self.on_cancel = on_cancel
+        self.on_selection = on_selection
         self.start = None
         self.rect = None
+        self.tops = []
+        self.closed = False
 
-        self.top = tk.Toplevel(root)
-        self.top.attributes("-fullscreen", True)
-        self.top.attributes("-alpha", 0.3)
-        self.top.attributes("-topmost", True)
-        self.top.configure(bg="black", cursor="crosshair")
+        for left, top, right, bottom in monitor_rectangles(root):
+            window = tk.Toplevel(root)
+            window.overrideredirect(True)
+            window.geometry(f"{right - left}x{bottom - top}{left:+d}{top:+d}")
+            window.attributes("-alpha", 0.3)
+            window.attributes("-topmost", True)
+            window.configure(bg="black", cursor="crosshair")
 
-        self.canvas = tk.Canvas(self.top, bg="black", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+            canvas = tk.Canvas(window, bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            canvas.bind("<ButtonPress-1>", lambda event, c=canvas, w=window: self.on_press(event, c, w))
+            canvas.bind("<B1-Motion>", lambda event, c=canvas, w=window: self.on_drag(event, c, w))
+            canvas.bind("<ButtonRelease-1>", lambda event, c=canvas, w=window: self.on_release(event, c, w))
+            window.bind("<Escape>", lambda _event: self.cancel())
+            self.tops.append(window)
 
-        self.canvas.bind("<ButtonPress-1>", self.on_press)
-        self.canvas.bind("<B1-Motion>", self.on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.top.bind("<Escape>", lambda e: self.top.destroy())
+        # Let the window manager finish mapping the windows before requesting
+        # focus, otherwise the hotkey can occasionally leave an inert overlay.
+        self.root.after_idle(self.focus)
 
-        self.top.focus_force()
+    def focus(self):
+        if not self.closed and self.tops:
+            self.tops[0].focus_force()
 
-    def on_press(self, event):
+    def close_windows(self):
+        for window in self.tops:
+            if window.winfo_exists():
+                window.destroy()
+        self.tops.clear()
+
+    def cancel(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.close_windows()
+        self.on_cancel()
+
+    def on_press(self, event, canvas, window):
         self.start = (event.x_root, event.y_root)
-        self.rect = self.canvas.create_rectangle(
+        self.rect = canvas.create_rectangle(
             event.x, event.y, event.x, event.y,
-            outline="#00b7ff", width=2, fill="white"
+            outline="#00b7ff", width=2
         )
 
-    def on_drag(self, event):
+    def on_drag(self, event, canvas, window):
         if self.rect:
-            x0 = self.start[0] - self.top.winfo_rootx()
-            y0 = self.start[1] - self.top.winfo_rooty()
-            self.canvas.coords(self.rect, x0, y0, event.x, event.y)
+            x0 = self.start[0] - window.winfo_rootx()
+            y0 = self.start[1] - window.winfo_rooty()
+            canvas.coords(self.rect, x0, y0, event.x, event.y)
 
-    def on_release(self, event):
+    def on_release(self, event, canvas, window):
+        if self.closed or not self.start:
+            return
         end = (event.x_root, event.y_root)
         x1, y1 = self.start
         x2, y2 = end
@@ -210,45 +269,51 @@ class SnipOverlay:
 
         bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
-        self.top.destroy()
+        self.closed = True
+        self.close_windows()
         self.root.update()
 
         if bbox[2] - bbox[0] < 5 or bbox[3] - bbox[1] < 5:
+            self.on_cancel()
             return
 
-        self.root.after(150, lambda: capture_and_ocr(self.root, bbox, rotation))
+        self.root.after(150, lambda: self.on_selection(bbox, rotation))
 
 
 def capture_and_ocr(root, bbox, rotation):
-    if not os.path.isfile(TESSERACT_PATH):
-        notify(root, "Tesseract not found",
-               f"Expected at:\n{TESSERACT_PATH}\n\n"
-               "Copy your Tesseract-OCR install into a 'tesseract' folder "
-               "next to this program.", error=True)
-        return
+    try:
+        if not os.path.isfile(TESSERACT_PATH):
+            notify(root, "Tesseract not found",
+                   f"Expected at:\n{TESSERACT_PATH}\n\n"
+                   "Copy your Tesseract-OCR install into a 'tesseract' folder "
+                   "next to this program.", error=True)
+            return
 
-    img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        img = ImageGrab.grab(bbox=bbox, all_screens=True)
 
-    if rotation is not None:
-        img = img.transpose(rotation)
+        if rotation is not None:
+            img = img.transpose(rotation)
 
-    w, h = img.size
-    img = img.resize((w * UPSCALE, h * UPSCALE), Image.LANCZOS).convert("L")
-    img = ImageOps.autocontrast(img)
+        w, h = img.size
+        img = img.resize((w * UPSCALE, h * UPSCALE), Image.LANCZOS).convert("L")
+        img = ImageOps.autocontrast(img)
 
-    raw = pytesseract.image_to_string(img, config=TESSERACT_CONFIG).strip()
+        raw = pytesseract.image_to_string(img, config=TESSERACT_CONFIG).strip()
 
-    if raw:
-        text = format_text(raw)
-        pyperclip.copy(text)
-        log("-" * 50)
-        log(text)
-        log("-" * 50)
-        notify(root, "Copied to clipboard", text)
-    else:
-        log("[no text found]")
-        notify(root, "No text found",
-               "Try a tighter box or zoom in on the drawing.", error=True)
+        if raw:
+            text = format_text(raw)
+            pyperclip.copy(text)
+            log("-" * 50)
+            log(text)
+            log("-" * 50)
+            notify(root, "Copied to clipboard", text)
+        else:
+            log("[no text found]")
+            notify(root, "No text found",
+                   "Try a tighter box or zoom in on the drawing.", error=True)
+    except Exception as exc:
+        log(f"[OCR error] {exc}")
+        notify(root, "Could not capture text", str(exc), error=True)
 
 
 # ======================= NOTIFICATION POPUP ===============================
@@ -301,23 +366,58 @@ def notify(root, title, body, error=False):
 
 # ======================= MAIN LOOP ========================================
 
+class SnipController:
+    """Serializes snips so repeated hotkeys cannot stack dark overlays."""
+    def __init__(self, root):
+        self.root = root
+        self.active = False
+
+    def start(self):
+        if self.active:
+            log("[snip already active]")
+            return
+
+        self.active = True
+        try:
+            SnipOverlay(self.root, self.finish, self.capture)
+        except Exception as exc:
+            self.active = False
+            log(f"[overlay error] {exc}")
+            notify(self.root, "Could not start snip", str(exc), error=True)
+
+    def capture(self, bbox, rotation):
+        try:
+            capture_and_ocr(self.root, bbox, rotation)
+        finally:
+            self.finish()
+
+    def finish(self):
+        self.active = False
+
+
 def poll(root):
     try:
         while True:
             evt = events.get_nowait()
             if evt == "snip":
-                SnipOverlay(root)
+                root.snip_controller.start()
             elif evt == "quit":
                 root.destroy()
                 return
     except queue.Empty:
         pass
+    except Exception as exc:
+        # Keep the background hotkey loop alive even if one queued action
+        # fails; otherwise the process remains in Task Manager but stops
+        # responding to Ctrl+Alt+S.
+        log(f"[event loop error] {exc}")
     root.after(80, lambda: poll(root))
 
 
 def main():
     root = tk.Tk()
     root.withdraw()
+    root.snip_controller = SnipController(root)
 
     keyboard.add_hotkey(HOTKEY_SNIP, lambda: events.put("snip"))
     keyboard.add_hotkey(HOTKEY_QUIT, lambda: events.put("quit"))
