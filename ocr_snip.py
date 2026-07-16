@@ -287,7 +287,21 @@ def monitor_rectangles(root):
 
 
 class SnipOverlay:
-    """One selection session represented by a dimmed window on every monitor."""
+    """One selection session: a single dimmed window spanning every monitor.
+
+    Earlier versions created one Toplevel per monitor and positioned each with
+    a Tk geometry string.  That breaks for any monitor placed above or left of
+    the primary, because those monitors have negative screen coordinates and Tk
+    geometry treats a leading minus as "measure from the opposite edge" (e.g.
+    "...+126-1053" means 1053px up from the bottom, not y = -1053).  The window
+    and its winfo_rootx/rooty coordinate model then disagree with the physical
+    screen, so the grab area is short/offset on those monitors.
+
+    Instead we build ONE overlay covering the whole virtual desktop, position it
+    natively (SetWindowPos handles negative coordinates correctly), and do all
+    selection math from absolute screen coordinates against a known origin - no
+    Tk geometry offsets and no winfo_rootx involved.
+    """
     def __init__(self, root, on_cancel, on_selection):
         self.root = root
         self.on_cancel = on_cancel
@@ -295,37 +309,44 @@ class SnipOverlay:
         self.start = None
         self.rect = None
         self.tops = []
-        self.rectangles = []
         self.closed = False
 
-        for left, top, right, bottom in monitor_rectangles(root):
-            window = tk.Toplevel(root)
-            window.overrideredirect(True)
-            window.geometry(f"{right - left}x{bottom - top}{left:+d}{top:+d}")
-            window.attributes("-alpha", 0.3)
-            window.attributes("-topmost", True)
-            window.configure(bg="black", cursor="crosshair")
+        rects = monitor_rectangles(root)
+        self.origin_x = min(r[0] for r in rects)
+        self.origin_y = min(r[1] for r in rects)
+        self.width = max(r[2] for r in rects) - self.origin_x
+        self.height = max(r[3] for r in rects) - self.origin_y
 
-            canvas = tk.Canvas(window, bg="black", highlightthickness=0)
-            canvas.pack(fill="both", expand=True)
-            canvas.bind("<ButtonPress-1>", lambda event, c=canvas, w=window: self.on_press(event, c, w))
-            canvas.bind("<B1-Motion>", lambda event, c=canvas, w=window: self.on_drag(event, c, w))
-            canvas.bind("<ButtonRelease-1>", lambda event, c=canvas, w=window: self.on_release(event, c, w))
-            window.bind("<Escape>", lambda _event: self.cancel())
-            self.tops.append(window)
-            self.rectangles.append((window, canvas, left, top, right, bottom))
+        window = tk.Toplevel(root)
+        window.overrideredirect(True)
+        # Size only here; final absolute placement (which may be negative) is
+        # done natively in place_and_focus. On non-Windows the origin is (0,0).
+        if sys.platform == "win32":
+            window.geometry(f"{self.width}x{self.height}")
+        else:
+            window.geometry(
+                f"{self.width}x{self.height}{self.origin_x:+d}{self.origin_y:+d}")
+        window.attributes("-alpha", 0.3)
+        window.attributes("-topmost", True)
+        window.configure(bg="black", cursor="crosshair")
 
-        # Let the window manager finish mapping the windows before requesting
+        canvas = tk.Canvas(window, bg="black", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.bind("<ButtonPress-1>", self.on_press)
+        canvas.bind("<B1-Motion>", self.on_drag)
+        canvas.bind("<ButtonRelease-1>", self.on_release)
+        window.bind("<Escape>", lambda _event: self.cancel())
+
+        self.window = window
+        self.canvas = canvas
+        self.tops.append(window)
+
+        # Let the window manager finish mapping the window before requesting
         # focus, otherwise the hotkey can occasionally leave an inert overlay.
         self.root.after_idle(self.place_and_focus)
 
     def place_and_focus(self):
-        """Use physical pixels for the final window placement on Windows.
-
-        Tk's geometry manager can apply its own DPI scaling to a Toplevel.  A
-        native SetWindowPos after Tk maps the window prevents a scaled external
-        monitor from having an uncovered strip along its edge.
-        """
+        """Pin the overlay to the whole virtual desktop in physical pixels."""
         if self.closed:
             return
         if sys.platform == "win32":
@@ -333,29 +354,23 @@ class SnipOverlay:
             hwnd_topmost = ctypes.c_void_p(-1)
             swp_noactivate_show = 0x0010 | 0x0040
             ga_root = 2  # GetAncestor(GA_ROOT): the real top-level frame HWND
-            for window, canvas, left, top, right, bottom in self.rectangles:
-                width, height = right - left, bottom - top
-                window.update_idletasks()
+            self.window.update_idletasks()
 
-                # winfo_id() can return an inner child HWND for a Tk toplevel;
-                # SetWindowPos must move the actual top-level frame or the
-                # window (and the canvas that fills it) can end up short or
-                # offset on a monitor whose scale factor differs from primary.
-                hwnd = user32.GetAncestor(window.winfo_id(), ga_root) or window.winfo_id()
-                user32.SetWindowPos(hwnd, hwnd_topmost, left, top,
-                                    width, height, swp_noactivate_show)
+            # winfo_id() can return an inner child HWND for a Tk toplevel;
+            # SetWindowPos must move the actual top-level frame. SetWindowPos
+            # takes raw signed coordinates, so negative origins (monitors above
+            # or left of primary) are placed correctly.
+            hwnd = user32.GetAncestor(self.window.winfo_id(), ga_root) or self.window.winfo_id()
+            user32.SetWindowPos(hwnd, hwnd_topmost,
+                                self.origin_x, self.origin_y,
+                                self.width, self.height, swp_noactivate_show)
+            self.canvas.configure(width=self.width, height=self.height)
+            self.window.update_idletasks()
 
-                # Don't trust pack()/DPI-scaling to have sized the canvas to
-                # the physical monitor. Pin it explicitly to the real pixel
-                # dimensions so the whole screen is snippable, not just a strip.
-                canvas.configure(width=width, height=height)
-                window.geometry(f"{width}x{height}{left:+d}{top:+d}")
-                window.update_idletasks()
-
-                if DEBUG_OVERLAY:
-                    log(f"[overlay] target={width}x{height}@({left},{top}) "
-                        f"window={window.winfo_width()}x{window.winfo_height()} "
-                        f"canvas={canvas.winfo_width()}x{canvas.winfo_height()}")
+            if DEBUG_OVERLAY:
+                log(f"[overlay] target={self.width}x{self.height}"
+                    f"@({self.origin_x},{self.origin_y}) "
+                    f"canvas={self.canvas.winfo_width()}x{self.canvas.winfo_height()}")
         self.focus()
 
     def focus(self):
@@ -375,20 +390,24 @@ class SnipOverlay:
         self.close_windows()
         self.on_cancel()
 
-    def on_press(self, event, canvas, window):
+    def _to_canvas(self, x_root, y_root):
+        """Map an absolute screen point to canvas coordinates."""
+        return x_root - self.origin_x, y_root - self.origin_y
+
+    def on_press(self, event):
         self.start = (event.x_root, event.y_root)
-        self.rect = canvas.create_rectangle(
-            event.x, event.y, event.x, event.y,
-            outline="#00b7ff", width=2
+        cx, cy = self._to_canvas(event.x_root, event.y_root)
+        self.rect = self.canvas.create_rectangle(
+            cx, cy, cx, cy, outline="#00b7ff", width=2
         )
 
-    def on_drag(self, event, canvas, window):
+    def on_drag(self, event):
         if self.rect:
-            x0 = self.start[0] - window.winfo_rootx()
-            y0 = self.start[1] - window.winfo_rooty()
-            canvas.coords(self.rect, x0, y0, event.x, event.y)
+            x0, y0 = self._to_canvas(*self.start)
+            x1, y1 = self._to_canvas(event.x_root, event.y_root)
+            self.canvas.coords(self.rect, x0, y0, x1, y1)
 
-    def on_release(self, event, canvas, window):
+    def on_release(self, event):
         if self.closed or not self.start:
             return
         end = (event.x_root, event.y_root)
